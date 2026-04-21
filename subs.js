@@ -1,4 +1,4 @@
-/* subs.js - 登録チャンネル専用ファイル */
+/* subs.js - 登録チャンネル専用ファイル (Invidious API対応版) */
 
 const SubsManager = {
     // データの取得
@@ -31,9 +31,9 @@ const SubsManager = {
         }
     },
 
-    // サイドバーの描画 (app.jsのloadSidebarLatestの代わり)
+    // サイドバーの描画
     updateSidebar() {
-        const container = document.getElementById('sidebar-subs-list'); // HTML側にこのIDのコンテナがある前提
+        const container = document.getElementById('sidebar-subs-list'); 
         if (!container) return;
         const subs = this.get();
         if (subs.length === 0) {
@@ -48,7 +48,7 @@ const SubsManager = {
         `).join('');
     },
 
-    // 「登録済み」メイン画面 (app.jsのActions.showSubsから移植)
+    // 「登録済み」メイン画面 (Invidious API化)
     async showSubs() {
         if (typeof Actions !== 'undefined') Actions.currentView = "subs";
         const subs = this.get();
@@ -69,26 +69,45 @@ const SubsManager = {
             <div style="padding: 20px;">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <h2 style="margin:0;">最新タイムライン</h2>
-                    <span style="font-size:12px; color:#aaa;">(3日以内の一括取得)</span>
+                    <span style="font-size:12px; color:#aaa;">(Invidious API経由)</span>
                 </div>
                 <div id="subs-timeline-grid" class="grid" style="margin-top:20px;">タイムライン読み込み中...</div>
             </div>
         `;
 
         try {
-            const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
             let allActivities = [];
+            // Invidious APIに5チャンネルずつリクエストを送る
             for (let i = 0; i < subs.length; i += 5) {
                 const chunk = subs.slice(i, i + 5);
-                const promises = chunk.map(ch => YT.fetchAPI('activities', { 
-                    channelId: ch.id, part: 'snippet,contentDetails', maxResults: 5, publishedAfter: threeDaysAgo.toISOString() 
-                }));
+                const promises = chunk.map(async (ch) => {
+                    try {
+                        const res = await fetch(`https://inv.thepixora.com/api/v1/channels/${ch.id}/videos`);
+                        if (!res.ok) return [];
+                        const data = await res.json();
+                        const videos = data.videos || data || [];
+                        // InvidiousのデータをYouTube v3形式にマッピング
+                        return videos.slice(0, 5).map(v => ({
+                            kind: 'youtube#video',
+                            id: v.videoId,
+                            snippet: {
+                                type: 'upload',
+                                title: v.title,
+                                channelTitle: v.author || ch.name,
+                                channelId: ch.id,
+                                // Invidiousのpublished(Unixタイム)をISO文字列に変換。無ければ現在時刻
+                                publishedAt: v.published ? new Date(v.published * 1000).toISOString() : new Date().toISOString(),
+                                thumbnails: { high: { url: v.videoThumbnails ? v.videoThumbnails[0].url : '' } }
+                            }
+                        }));
+                    } catch(e) { return []; }
+                });
                 const results = await Promise.all(promises);
-                results.forEach(res => { if (res.items) allActivities = [...allActivities, ...res.items]; });
+                results.forEach(res => { allActivities = [...allActivities, ...res]; });
             }
-            const timelineVideos = allActivities
-                .filter(a => a.snippet.type === 'upload')
-                .sort((a, b) => new Date(b.snippet.publishedAt) - new Date(a.snippet.publishedAt));
+            
+            // 日付の新しい順にソート
+            const timelineVideos = allActivities.sort((a, b) => new Date(b.snippet.publishedAt) - new Date(a.snippet.publishedAt));
 
             if (typeof Actions !== 'undefined') {
                 Actions.currentList = timelineVideos;
