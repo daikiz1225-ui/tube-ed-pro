@@ -1,4 +1,4 @@
-/* app.js - Subscriptions Refined & Sidebar Cleaned (NO TRUNCATION) */
+/* app.js - Subscriptions Refined, Sidebar Cleaned & Backend Proxy Integrated (NO TRUNCATION) */
 
 // --- ユーティリティ ---
 function timeAgo(dateString) {
@@ -19,6 +19,47 @@ function formatViews(views) {
     if (num >= 1000) return `${(num / 1000).toFixed(1)}千回`;
     return `${num}回`;
 }
+
+// Invidious APIへの通信を「自分のバックエンド(/api/search)」経由で行うラッパー
+const InvAPI = {
+    async search(params) {
+        // フロントエンドは自分のサーバーの /api/search を叩くだけ。
+        // ブロック回避のため、決して inv.thepixora.com 等の外部URLを直接叩かない。
+        let url = `/api/search?q=${encodeURIComponent(params.q || '')}`;
+        if (params.page) url += `&page=${params.page}`;
+        if (params.type) url += `&type=${params.type}`;
+        
+        try {
+            const res = await fetch(url);
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            
+            // バックエンドから返ってきたInvidious形式のJSONをYouTube V3形式に変換
+            const items = data.map(item => {
+                const isPl = item.type === 'playlist';
+                return {
+                    kind: isPl ? 'youtube#playlist' : 'youtube#video',
+                    id: isPl ? { playlistId: item.playlistId } : { videoId: item.videoId },
+                    snippet: {
+                        title: item.title,
+                        channelTitle: item.author,
+                        channelId: item.authorId,
+                        publishedAt: item.publishedText ? new Date().toISOString() : new Date().toISOString(),
+                        thumbnails: {
+                            high: { url: isPl && item.playlistThumbnails ? item.playlistThumbnails[0]?.url : (item.videoThumbnails ? item.videoThumbnails[0]?.url : '') }
+                        },
+                        liveBroadcastContent: item.liveNow ? 'live' : 'none'
+                    }
+                };
+            });
+            // ページ番号をインクリメントしてトークン代わりに返す
+            return { items: items, nextPageToken: (params.page || 1) + 1 };
+        } catch(e) { 
+            console.error("Backend Search Proxy Error", e);
+            return { items: [], nextPageToken: "" }; 
+        }
+    }
+};
 
 const YT = {
     keys: ["AIzaSyBfCvyZ_J9mJiMFNYB6WfcuLyvf9zDdcUU", "AIzaSyCgVn-JWHKT_z6EC73Z6Vlex0F_d-BP_fY", "AIzaSyBbqPhAbqoWDOurTt7hejQmwc6dAoZ5Iy0", "AIzaSyAWk9mmie23-khi8-nipv1jHJND__UtEWA", "AIzaSyBL38iyqeiaKHoKqhloSnhG590DfJ35vCE","AIzaSyDU4jrOT0o2Jd4zDwZyU5OOBsKt1P3RJNs","AIzaSyB2L_plk45E1wihBUB4VJ516pIfqcBc2Yw","AIzaSyDcYrvxFDKcXNqI65Aihrqk0uK2Ebj7KVo","AIzaSyAmfASO-61oyXFOfzJCR9e3oGbnKenBZb","AIzaSyCU7xnDWAFbXt1ze0_DBaWDKt7NDT1XP7"],
@@ -157,8 +198,6 @@ const Storage = {
         }
     },
 
-    // toggleSubはsubs.jsに移行したため削除
-
     toggleWatchLater(v) {
         let list = this.get('yt_watchlater');
         const i = list.findIndex(x => x.id === v.id);
@@ -201,6 +240,7 @@ const Actions = {
     currentIndex: -1,
     channelIcons: {},
     currentView: "home",
+    currentApiSource: "youtube", // 'youtube' or 'invidious'
     nextToken: "",
     currentParams: {},
     selectedSubs: [],
@@ -253,7 +293,6 @@ const Actions = {
                 sidebar.insertAdjacentHTML('beforeend', `<hr><div id="nav-admin-login" class="nav-item" onclick="Actions.adminLogin()" style="opacity:0.5; font-size:12px;">🔑<span>${Storage.isAdmin() ? '管理者ログイン済み' : '管理者ログイン'}</span></div>`);
             }
         }
-        // 初期化時にサイドバー描画
         if (typeof SubsManager !== 'undefined') SubsManager.updateSidebar();
     },
 
@@ -385,8 +424,12 @@ const Actions = {
         try {
             const resp = await fetch('/api/get_recommend', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ history: history }) });
             const aiData = await resp.json();
-            this.currentParams = { q: aiData.query, part: 'snippet', maxResults: 24, type: 'video' };
-            const data = await YT.fetchAPI('search', this.currentParams);
+            
+            // バックエンドAPI経由で検索を実行
+            this.currentParams = { q: aiData.query, page: 1, type: 'video' };
+            this.currentApiSource = 'invidious';
+            const data = await InvAPI.search(this.currentParams);
+            
             this.currentList = data.items || [];
             this.nextToken = data.nextPageToken || "";
             await this.fillStats(this.currentList);
@@ -403,6 +446,7 @@ const Actions = {
 
     async goHome() {
         this.currentView = "home";
+        this.currentApiSource = "youtube"; // 急上昇は標準APIを使用
         this.activePlaylistName = null;
         this.currentParams = { chart: 'mostPopular', regionCode: 'JP', part: 'snippet', maxResults: 24 };
         const data = await YT.fetchAPI('videos', this.currentParams);
@@ -415,8 +459,10 @@ const Actions = {
     async showShorts() {
         this.currentView = "shorts";
         this.activePlaylistName = null;
-        this.currentParams = { q: '#Shorts', part: 'snippet', type: 'video', videoDuration: 'short', maxResults: 24 };
-        const data = await YT.fetchAPI('search', this.currentParams);
+        // バックエンド経由の検索
+        this.currentParams = { q: '#Shorts', page: 1, type: 'video' };
+        this.currentApiSource = 'invidious';
+        const data = await InvAPI.search(this.currentParams);
         this.currentList = data.items || [];
         this.nextToken = data.nextPageToken || "";
         await this.fillStats(this.currentList);
@@ -426,8 +472,10 @@ const Actions = {
     async showLiveHub() {
         this.currentView = "live";
         this.activePlaylistName = null;
-        this.currentParams = { q: 'live', part: 'snippet', type: 'video', eventType: 'live', regionCode: 'JP', maxResults: 24 };
-        const data = await YT.fetchAPI('search', this.currentParams);
+        // バックエンド経由の検索
+        this.currentParams = { q: 'live', page: 1, type: 'video' };
+        this.currentApiSource = 'invidious';
+        const data = await InvAPI.search(this.currentParams);
         this.currentList = data.items || [];
         this.nextToken = data.nextPageToken || "";
         await this.fillStats(this.currentList);
@@ -438,26 +486,30 @@ const Actions = {
         const q = document.getElementById('search-input').value;
         if (!q) return;
         let finalQ = q;
-        const vParams = { part: 'snippet', maxResults: 15, type: 'video' };
-        let includePlaylists = true;
+        let vParams = { q: finalQ, page: 1 };
+        
         if (this.currentView === "shorts") {
-            finalQ = `${q} #shorts`;
-            vParams.videoDuration = "short";
-            includePlaylists = false;
+            vParams.q = `${q} #shorts`;
+            vParams.type = "video";
         } else if (this.currentView === "live") {
-            vParams.eventType = "live";
-            includePlaylists = false;
+            vParams.q = `${q} live`;
+            vParams.type = "video";
         }
-        vParams.q = finalQ;
+
         this.currentParams = vParams;
-        const promises = [YT.fetchAPI('search', vParams)];
-        if (includePlaylists) {
-            promises.push(YT.fetchAPI('search', { q, part: 'snippet', maxResults: 5, type: 'playlist' }));
+        this.currentApiSource = 'invidious'; 
+
+        // フロントは自分のバックエンド(/api/search)を叩くだけ
+        const promises = [InvAPI.search(vParams)];
+        if (this.currentView !== "shorts" && this.currentView !== "live") {
+            promises.push(InvAPI.search({ q, page: 1, type: 'playlist' }));
         }
+
         const results = await Promise.all(promises);
         const vData = results[0];
         const plData = results[1] || { items: [] };
         const limitedPlaylists = plData.items.slice(0, 5);
+        
         this.currentList = [...limitedPlaylists, ...vData.items];
         this.nextToken = vData.nextPageToken || "";
         this.activePlaylistName = null; 
@@ -507,15 +559,25 @@ const Actions = {
 
     async loadMore() {
         if (!this.nextToken) return;
-        let endpoint = 'search';
-        if (this.currentView === 'home' && !this.currentParams.q) endpoint = 'videos';
-        else if (this.currentView === 'playlist') endpoint = 'playlistItems';
-        else if (this.currentView === 'channel_playlists') endpoint = 'playlists';
-        const data = await YT.fetchAPI(endpoint, { ...this.currentParams, pageToken: this.nextToken });
-        const newItems = data.items || [];
+        
+        let newItems = [];
+        if (this.currentApiSource === 'invidious') {
+            this.currentParams.page = this.nextToken;
+            const data = await InvAPI.search(this.currentParams);
+            newItems = data.items || [];
+            this.nextToken = data.nextPageToken || "";
+        } else {
+            let endpoint = 'search';
+            if (this.currentView === 'home' && !this.currentParams.q) endpoint = 'videos';
+            else if (this.currentView === 'playlist') endpoint = 'playlistItems';
+            else if (this.currentView === 'channel_playlists') endpoint = 'playlists';
+            const data = await YT.fetchAPI(endpoint, { ...this.currentParams, pageToken: this.nextToken });
+            newItems = data.items || [];
+            this.nextToken = data.nextPageToken || "";
+        }
+
         await this.fillStats(newItems);
         this.currentList = [...this.currentList, ...newItems];
-        this.nextToken = data.nextPageToken || "";
         this.renderGrid();
     },
 
@@ -676,7 +738,8 @@ const Actions = {
                 this.relatedList = this.currentList;
             } else {
                 const qK = snip.title.replace(/[【】「」]/g, ' ').split(' ').filter(w => w.length > 1).slice(0, 3).join(' ');
-                const rel = await YT.fetchAPI('search', { q: qK, type: 'video', part: 'snippet', maxResults: 15 });
+                // 関連動画もバックエンド経由でInvidious検索
+                const rel = await InvAPI.search({ q: qK, type: 'video', page: 1 });
                 this.relatedList = rel.items || [];
                 await this.fillStats(this.relatedList);
             }
@@ -707,6 +770,7 @@ const Actions = {
 
     async showChannel(chId) {
         this.currentView = "channel";
+        this.currentApiSource = "youtube"; // チャンネル詳細は標準APIを使用
         const chData = await YT.fetchAPI('channels', { id: chId, part: 'snippet,brandingSettings' });
         const ch = chData.items[0];
         const isSubbed = (typeof SubsManager !== 'undefined' ? SubsManager.get() : []).some(x => x.id === chId);
@@ -732,6 +796,7 @@ const Actions = {
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
         if (type === 'videos') {
             this.currentView = "channel";
+            this.currentApiSource = "youtube";
             this.currentParams = { channelId: chId, part: 'snippet', type: 'video', order: order, maxResults: 24 };
             const data = await YT.fetchAPI('search', this.currentParams);
             this.currentList = data.items || []; this.nextToken = data.nextPageToken || "";
@@ -739,6 +804,7 @@ const Actions = {
             grid.innerHTML = this.renderCards(this.currentList);
         } else if (type === 'playlists') {
             this.currentView = "channel_playlists";
+            this.currentApiSource = "youtube";
             this.currentParams = { channelId: chId, part: 'snippet', maxResults: 24 };
             const data = await YT.fetchAPI('playlists', this.currentParams);
             this.currentList = data.items || [];
@@ -750,6 +816,7 @@ const Actions = {
 
     async showPlaylistView(plId, title) {
         this.currentView = "playlist";
+        this.currentApiSource = "youtube";
         this.activePlaylistName = title;
         this.currentParams = { playlistId: plId, part: 'snippet,contentDetails', maxResults: 24 };
         const data = await YT.fetchAPI('playlistItems', this.currentParams);
@@ -757,8 +824,6 @@ const Actions = {
         await this.fillStats(this.currentList);
         this.renderGrid(`<h2>再生リスト: ${title}</h2>`);
     },
-
-    // handleSub, showSubsはsubs.jsに移行したため削除
 
     showWatchLater() {
         this.currentView = "watchlater";
