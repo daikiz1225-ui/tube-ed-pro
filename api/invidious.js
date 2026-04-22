@@ -1,42 +1,109 @@
-export const config = { runtime: 'edge' };
+/**
+ * /api/invidious.js
+ * フロントエンドからの要求を Invidious API に橋渡しするプロキシ
+ */
 
-const BASE = 'https://inv.thepixora.com/api/v1';
+export const config = {
+    runtime: 'edge', // 高速応答のため Edge Runtime を使用
+};
+
+// 信頼性の高い Invidious インスタンス（必要に応じて変更可能）
+const INVIDIOUS_BASE = 'https://inv.thepixora.com/api/v1';
 
 export default async function handler(req) {
     const { searchParams } = new URL(req.url);
     const endpoint = searchParams.get('endpoint');
     
-    let target = '';
-    
+    // パラメータの取得
+    const id = searchParams.get('id') || searchParams.get('videoId');
+    const q = searchParams.get('q');
+    const channelId = searchParams.get('channelId');
+    const playlistId = searchParams.get('playlistId');
+    const pageToken = searchParams.get('pageToken') || searchParams.get('continuation');
+    const region = searchParams.get('region') || 'JP';
+    const type = searchParams.get('type') || 'video'; // video, channel, playlist
+
+    let targetUrl = '';
+
+    // フロントエンドのエンドポイント名に基づいて Invidious の URL を構築
     switch (endpoint) {
         case 'trending':
-            target = `${BASE}/trending?region=${searchParams.get('region') || 'JP'}`;
+            targetUrl = `${INVIDIOUS_BASE}/trending?region=${region}`;
             break;
+
         case 'search':
-            target = `${BASE}/search?q=${encodeURIComponent(searchParams.get('q'))}`;
+            // 検索ワード、ページネーション、タイプ（動画/チャンネル等）をサポート
+            targetUrl = `${INVIDIOUS_BASE}/search?q=${encodeURIComponent(q)}&type=${type}`;
+            if (pageToken) targetUrl += `&page=${pageToken}`;
             break;
+
         case 'videos':
-            target = `${BASE}/videos/${searchParams.get('id')}`;
-            break;
         case 'related':
-            target = `${BASE}/videos/${searchParams.get('id')}`; // Invidiousは動画詳細に関連動画が含まれる
+            // 動画詳細と関連動画（Invidiousでは1つのAPIで両方取得可能）
+            targetUrl = `${INVIDIOUS_BASE}/videos/${id}`;
             break;
+
         case 'channelVideos':
-            target = `${BASE}/channels/${searchParams.get('channelId')}/videos`;
+            // チャンネル内の動画一覧
+            targetUrl = `${INVIDIOUS_BASE}/channels/${channelId}/videos`;
+            if (pageToken) targetUrl += `?continuation=${pageToken}`;
             break;
+
+        case 'channels':
+            // チャンネルの基本情報（アイコン等）
+            targetUrl = `${INVIDIOUS_BASE}/channels/${id}`;
+            break;
+
+        case 'playlists':
+            // チャンネルが持っている再生リストの一覧
+            targetUrl = `${INVIDIOUS_BASE}/channels/${channelId}/playlists`;
+            break;
+
+        case 'playlistItems':
+            // 特定の再生リスト内の動画一覧
+            targetUrl = `${INVIDIOUS_BASE}/playlists/${playlistId}`;
+            break;
+
         default:
-            return new Response("Invalid Endpoint", { status: 400 });
+            // デフォルトはトレンドを返す
+            targetUrl = `${INVIDIOUS_BASE}/trending?region=${region}`;
     }
 
     try {
-        const res = await fetch(target);
-        const data = await res.json();
-        
-        // 関連動画リクエストの場合は、レスポンスの 'related' 部分だけを抽出して返すなどの調整が可能
+        const response = await fetch(targetUrl, {
+            headers: {
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Vercel Serverless Function)'
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Invidious API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        // クライアント側で YouTube 形式に変換しやすいよう、そのまま JSON で返す
         return new Response(JSON.stringify(data), {
+            status: 200,
+            headers: {
+                'Content-Type': 'application/json',
+                'Cache-Control': 'public, s-maxage=3600, stale-while-revalidate=1800', // キャッシュ設定
+                'Access-Control-Allow-Origin': '*'
+            }
+        });
+
+    } catch (error) {
+        console.error('Backend Error:', error);
+        
+        // エラー時はフロントエンドが止まらないよう、正常な形式の空データを返す
+        return new Response(JSON.stringify({
+            items: [],
+            error: error.message,
+            nextPageToken: null
+        }), {
+            status: 200, // フロントエンドのエラーハンドリングに合わせる
             headers: { 'Content-Type': 'application/json' }
         });
-    } catch (e) {
-        return new Response(JSON.stringify({ error: true, items: [] }), { status: 200 });
     }
 }
